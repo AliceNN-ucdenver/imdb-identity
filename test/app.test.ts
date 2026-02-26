@@ -220,6 +220,83 @@ describe('SSRF protection — /api/fetch-url', () => {
   });
 
   // -------------------------------------------------------------------------
+  // Domain allowlist (ALLOWED_FETCH_DOMAINS)
+  // -------------------------------------------------------------------------
+
+  it('rejects domain not in allowlist when ALLOWED_FETCH_DOMAINS is set', async () => {
+    process.env.ALLOWED_FETCH_DOMAINS = 'allowed.com,trusted.com';
+    try {
+      const res = await request(app)
+        .post('/api/fetch-url')
+        .send({ url: 'https://example.com/' })
+        .expect(400);
+      assert.strictEqual(res.body.error, 'Invalid or disallowed URL');
+      assert.ok(!fetchStub.called, 'fetch should not be called');
+    } finally {
+      delete process.env.ALLOWED_FETCH_DOMAINS;
+    }
+  });
+
+  it('allows domain in allowlist when ALLOWED_FETCH_DOMAINS is set', async () => {
+    process.env.ALLOWED_FETCH_DOMAINS = 'example.com,trusted.com';
+    try {
+      const res = await request(app)
+        .post('/api/fetch-url')
+        .send({ url: 'https://example.com/' })
+        .expect(200);
+      assert.strictEqual(res.body.content, 'hello world');
+    } finally {
+      delete process.env.ALLOWED_FETCH_DOMAINS;
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Request timeout
+  // -------------------------------------------------------------------------
+
+  it('returns 500 when request times out (AbortError)', async () => {
+    const abortError = Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+    fetchStub.rejects(abortError);
+    const res = await request(app)
+      .post('/api/fetch-url')
+      .send({ url: 'https://example.com/' })
+      .expect(500);
+    assert.strictEqual(res.body.error, 'Request timed out');
+  });
+
+  // -------------------------------------------------------------------------
+  // Response size limits
+  // -------------------------------------------------------------------------
+
+  it('returns 502 when Content-Length header exceeds 10 MB', async () => {
+    fetchStub.resolves({
+      headers: { get: (name: string) => name === 'content-length' ? String(11 * 1024 * 1024) : null },
+      text: () => Promise.resolve('small body'),
+      ok: true,
+      status: 200,
+    } as any);
+    const res = await request(app)
+      .post('/api/fetch-url')
+      .send({ url: 'https://example.com/' })
+      .expect(502);
+    assert.strictEqual(res.body.error, 'Response too large');
+  });
+
+  it('returns 502 when response body exceeds 10 MB', async () => {
+    fetchStub.resolves({
+      headers: { get: () => null },
+      text: () => Promise.resolve('x'.repeat(11 * 1024 * 1024)),
+      ok: true,
+      status: 200,
+    } as any);
+    const res = await request(app)
+      .post('/api/fetch-url')
+      .send({ url: 'https://example.com/' })
+      .expect(502);
+    assert.strictEqual(res.body.error, 'Response too large');
+  });
+
+  // -------------------------------------------------------------------------
   // Happy path
   // -------------------------------------------------------------------------
 
