@@ -133,15 +133,73 @@ app.post('/api/upload', (req, res) => {
   res.json({ message: 'File uploaded', fileName });
 });
 
-// A10 - SSRF: Unvalidated URL fetching
+// Validates a URL to prevent SSRF attacks
+function isSafeUrl(rawUrl: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+
+  // Only allow HTTPS
+  if (parsed.protocol !== 'https:') {
+    return false;
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+
+  // Block localhost and loopback
+  if (hostname === 'localhost' || hostname === '0.0.0.0') {
+    return false;
+  }
+
+  // Block IPv4 private, loopback, and link-local ranges
+  const ipv4 = hostname.match(
+    /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
+  );
+  if (ipv4) {
+    const [o1, o2, o3, o4] = ipv4.slice(1).map(Number);
+    // Reject invalid octets (> 255)
+    if (o1 > 255 || o2 > 255 || o3 > 255 || o4 > 255) {
+      return false;
+    }
+    if (
+      o1 === 10 ||                               // 10.0.0.0/8
+      o1 === 127 ||                              // 127.0.0.0/8 (loopback)
+      (o1 === 169 && o2 === 254) ||              // 169.254.0.0/16 (link-local / AWS metadata)
+      (o1 === 172 && o2 >= 16 && o2 <= 31) ||   // 172.16.0.0/12
+      (o1 === 192 && o2 === 168)                 // 192.168.0.0/16
+    ) {
+      return false;
+    }
+  }
+
+  // Block IPv6 loopback (::1) and link-local (fe80::/10 covers fe80:: – febf::)
+  const bare = hostname.replace(/^\[|\]$/g, '');
+  if (bare === '::1' || /^fe[89ab]/i.test(bare)) {
+    return false;
+  }
+
+  return true;
+}
+
+// A10 - SSRF: Fixed with URL validation
 app.post('/api/fetch-url', async (req, res) => {
   const { url } = req.body;
 
-  // No URL validation - allows internal network access
-  const response = await fetch(url);
-  const data = await response.text();
+  if (!url || !isSafeUrl(url)) {
+    res.status(400).json({ error: 'Invalid or disallowed URL' });
+    return;
+  }
 
-  res.json({ content: data });
+  try {
+    const response = await fetch(url);
+    const data = await response.text();
+    res.json({ content: data });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch URL' });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
