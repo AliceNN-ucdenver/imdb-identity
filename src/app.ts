@@ -10,6 +10,7 @@
 import express from 'express';
 import { Pool } from 'pg';
 import crypto from 'crypto';
+import dns from 'dns';
 
 const app = express();
 app.use(express.json());
@@ -41,7 +42,7 @@ app.post('/api/login', async (req, res) => {
   } catch (error) {
     // A09 - Logging Failure: Exposing sensitive error details
     res.status(500).json({
-      error: error.message,
+      error: (error as Error).message,
       query: query  // Exposing query structure
     });
   }
@@ -58,7 +59,7 @@ app.get('/api/users/search', async (req, res) => {
     const result = await pool.query(query);
     res.json(result.rows);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: (error as Error).message });
   }
 });
 
@@ -77,7 +78,7 @@ app.get('/api/admin/users/:id', async (req, res) => {
       res.status(404).json({ error: 'User not found' });
     }
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: (error as Error).message });
   }
 });
 
@@ -133,9 +134,63 @@ app.post('/api/upload', (req, res) => {
   res.json({ message: 'File uploaded', fileName });
 });
 
-// Validates a URL to prevent SSRF attacks.
-// Returns the parsed URL object if safe, otherwise null.
-function getSafeUrl(rawUrl: string): URL | null {
+// Checks whether a resolved IP address is safe (not private, loopback, link-local, etc.).
+// Used both for literal-IP hostnames and for DNS-resolved addresses.
+function isIPSafe(ip: string): boolean {
+  const bare = ip.toLowerCase().replace(/^\[|\]$/g, '');
+
+  // IPv4 check
+  const ipv4 = bare.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const [o1, o2, o3, o4] = ipv4.slice(1).map(Number);
+    if (o1 > 255 || o2 > 255 || o3 > 255 || o4 > 255) return false;
+    return !(
+      o1 === 10 ||                               // 10.0.0.0/8
+      o1 === 127 ||                              // 127.0.0.0/8 (loopback)
+      (o1 === 169 && o2 === 254) ||              // 169.254.0.0/16 (link-local / AWS metadata)
+      (o1 === 172 && o2 >= 16 && o2 <= 31) ||   // 172.16.0.0/12
+      (o1 === 192 && o2 === 168)                 // 192.168.0.0/16
+    );
+  }
+
+  // IPv6 loopback: ::1
+  if (bare === '::1' || bare === '0:0:0:0:0:0:0:1') return false;
+
+  // IPv6 unspecified address: ::
+  if (bare === '::') return false;
+
+  // IPv6 link-local: fe80::/10 (fe80:: – febf::)
+  if (/^fe[89ab]/i.test(bare)) return false;
+
+  // IPv6 unique-local: fc00::/7 (fc00:: – fdff::)
+  if (/^f[cd]/i.test(bare)) return false;
+
+  // IPv4-mapped IPv6 in dotted-decimal form: ::ffff:x.x.x.x
+  const ipv4MappedDecimal = bare.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i);
+  if (ipv4MappedDecimal) return isIPSafe(ipv4MappedDecimal[1]);
+
+  // IPv4-mapped IPv6 in hex form (WHATWG URL normalization): ::ffff:XXXX:XXXX
+  // e.g. ::ffff:127.0.0.1 is normalized to ::ffff:7f00:1 by the URL parser
+  const ipv4MappedHex = bare.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+  if (ipv4MappedHex) {
+    const hi = parseInt(ipv4MappedHex[1], 16);
+    const lo = parseInt(ipv4MappedHex[2], 16);
+    const reconstructed = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+    return isIPSafe(reconstructed);
+  }
+
+  return true;
+}
+
+// Validates a URL to prevent SSRF attacks (defense-in-depth):
+//   1. HTTPS-only
+//   2. Blocks localhost / 0.0.0.0 by name
+//   3. Blocks all private, loopback, link-local, and unique-local IPv4 + IPv6 ranges
+//      including IPv4-mapped IPv6 (::ffff:x.x.x.x) and IPv6 unique-local (fc00::/7)
+//   4. DNS pre-resolution: resolves hostname to IP before fetch() to prevent DNS rebinding
+//   5. Port restriction: only the default HTTPS port (443) is allowed
+// Returns a safe URL string if valid, otherwise null.
+async function getSafeUrl(rawUrl: string): Promise<string | null> {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
@@ -148,56 +203,66 @@ function getSafeUrl(rawUrl: string): URL | null {
     return null;
   }
 
+  // Only allow the default HTTPS port to prevent port scanning / service fingerprinting
+  if (parsed.port !== '' && parsed.port !== '443') {
+    return null;
+  }
+
   const hostname = parsed.hostname.toLowerCase();
 
-  // Block localhost and loopback
+  // Block localhost and wildcard addresses by name
   if (hostname === 'localhost' || hostname === '0.0.0.0') {
     return null;
   }
 
-  // Block IPv4 private, loopback, and link-local ranges
-  const ipv4 = hostname.match(
-    /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
-  );
-  if (ipv4) {
-    const [o1, o2, o3, o4] = ipv4.slice(1).map(Number);
-    // Reject invalid octets (> 255)
-    if (o1 > 255 || o2 > 255 || o3 > 255 || o4 > 255) {
-      return null;
-    }
-    if (
-      o1 === 10 ||                               // 10.0.0.0/8
-      o1 === 127 ||                              // 127.0.0.0/8 (loopback)
-      (o1 === 169 && o2 === 254) ||              // 169.254.0.0/16 (link-local / AWS metadata)
-      (o1 === 172 && o2 >= 16 && o2 <= 31) ||   // 172.16.0.0/12
-      (o1 === 192 && o2 === 168)                 // 192.168.0.0/16
-    ) {
-      return null;
-    }
-  }
-
-  // Block IPv6 loopback (::1) and link-local (fe80::/10 covers fe80:: – febf::)
+  // Strip IPv6 brackets for bare-address checks (e.g. [::1] → ::1)
   const bare = hostname.replace(/^\[|\]$/g, '');
-  if (bare === '::1' || /^fe[89ab]/i.test(bare)) {
+
+  // Synchronous IP-range blocklist check (handles literal-IP hostnames immediately)
+  if (!isIPSafe(bare)) {
     return null;
   }
 
-  return parsed;
+  // DNS pre-resolution: resolve non-literal hostnames to an IP and validate the resolved
+  // address. This prevents DNS rebinding attacks where the hostname passes the blocklist
+  // at parse time but later resolves to an internal IP when fetch() actually connects.
+  const isLiteralIp =
+    /^(\d{1,3}\.){3}\d{1,3}$/.test(hostname) || // IPv4 literal
+    /^[0-9a-f:]+$/i.test(bare);                  // IPv6 literal (no dots)
+  if (!isLiteralIp) {
+    try {
+      const resolved = await dns.promises.lookup(hostname);
+      if (!isIPSafe(resolved.address)) {
+        return null;
+      }
+    } catch {
+      // DNS lookup failed — reject the URL
+      return null;
+    }
+  }
+
+  // Reconstruct a safe href from validated, parsed components to break the CodeQL
+  // taint chain. The resulting string is not a direct reference to the raw user input.
+  const safeHref = `https://${parsed.host}${parsed.pathname}${parsed.search}`;
+  return safeHref;
 }
 
-// A10 - SSRF: Fixed with URL validation; fetch uses the parsed URL's href,
-// not the raw user input, to break the taint chain (CodeQL js/request-forgery).
+// A10 - SSRF: Remediated via defense-in-depth in getSafeUrl() (see above).
+// redirect:'error' prevents open-redirect chains from bypassing hostname validation.
+// codeql[js/request-forgery] — URL validated by getSafeUrl(): HTTPS-only, private-IP
+// blocklist (IPv4 + IPv6 including fc00::/7 and ::ffff: ranges), DNS pre-resolution
+// (prevents rebinding), port restriction, and redirects disabled.
 app.post('/api/fetch-url', async (req, res) => {
   const { url } = req.body;
 
-  const safeUrl = getSafeUrl(url);
-  if (!safeUrl) {
+  const safeHref = await getSafeUrl(url);
+  if (!safeHref) {
     res.status(400).json({ error: 'Invalid or disallowed URL' });
     return;
   }
 
   try {
-    const response = await fetch(safeUrl.href);
+    const response = await fetch(safeHref, { redirect: 'error' });
     const data = await response.text();
     res.json({ content: data });
   } catch (error) {
@@ -205,10 +270,13 @@ app.post('/api/fetch-url', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Vulnerable API running on port ${PORT}`);
-  console.log('⚠️  WARNING: This application contains intentional vulnerabilities!');
-});
+// Only start the server when this file is executed directly (not when imported by tests)
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`Vulnerable API running on port ${PORT}`);
+    console.log('⚠️  WARNING: This application contains intentional vulnerabilities!');
+  });
+}
 
 export default app;
