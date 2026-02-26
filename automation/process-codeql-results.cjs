@@ -363,10 +363,21 @@ function createIssueBody(g, prompts) {
     body += `</details>\n\n`;
   }
 
+  // Prompt pack file references
+  body += `---\n\n## Prompt Packs\n\n`;
+  body += `This repository contains scaffolded prompt packs in \`.cheshire/prompts/\` with detailed implementation guidance.\n`;
+  body += `Read the following files for security-first remediation instructions:\n\n`;
+  if (prompts.owaspKey && prompts.owaspKey !== 'unmapped') {
+    body += `- \`.cheshire/prompts/owasp/${prompts.owaspKey}.md\` — OWASP security guidance for this vulnerability category\n`;
+  }
+  body += `- \`.cheshire/prompts/default.md\` — Security-first baseline (always applicable)\n`;
+  body += `- \`.cheshire/prompts/maintainability/maintainability.md\` — Maintainability guidance\n`;
+  body += `- \`.cheshire/prompts/threat-modeling/stride.md\` — STRIDE threat model analysis\n\n`;
+
   // Remediation zone
   body += `---\n\n## Claude Remediation Zone\n\n`;
   body += `To request a remediation plan, post this comment:\n\n`;
-  body += `\`\`\`\n@claude Please provide a remediation plan for all ${count} occurrence${count > 1 ? 's' : ''} of this vulnerability in ${g.filePath} following the security guidelines provided.\n\`\`\`\n\n---\n\n`;
+  body += `\`\`\`\n@claude Read the prompt packs in .cheshire/prompts/ for security guidance, then provide a remediation plan for all ${count} occurrence${count > 1 ? 's' : ''} of this vulnerability in ${g.filePath}. Follow the RCTRO (Role/Context/Task/Requirements/Output) patterns from the prompt packs.\n\`\`\`\n\n---\n\n`;
 
   // Metadata
   body += `<details>\n<summary>Additional Metadata</summary>\n\n`;
