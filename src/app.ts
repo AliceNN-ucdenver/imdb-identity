@@ -195,16 +195,19 @@ async function getSafeUrl(rawUrl: string): Promise<string | null> {
   try {
     parsed = new URL(rawUrl);
   } catch {
+    console.error(JSON.stringify({ event: 'ssrf_blocked', reason: 'invalid_url', url: rawUrl }));
     return null;
   }
 
   // Only allow HTTPS
   if (parsed.protocol !== 'https:') {
+    console.error(JSON.stringify({ event: 'ssrf_blocked', reason: 'non_https_protocol', url: rawUrl }));
     return null;
   }
 
   // Only allow the default HTTPS port to prevent port scanning / service fingerprinting
   if (parsed.port !== '' && parsed.port !== '443') {
+    console.error(JSON.stringify({ event: 'ssrf_blocked', reason: 'non_standard_port', url: rawUrl }));
     return null;
   }
 
@@ -212,6 +215,7 @@ async function getSafeUrl(rawUrl: string): Promise<string | null> {
 
   // Block localhost and wildcard addresses by name
   if (hostname === 'localhost' || hostname === '0.0.0.0') {
+    console.error(JSON.stringify({ event: 'ssrf_blocked', reason: 'blocked_hostname', url: rawUrl }));
     return null;
   }
 
@@ -220,6 +224,7 @@ async function getSafeUrl(rawUrl: string): Promise<string | null> {
 
   // Synchronous IP-range blocklist check (handles literal-IP hostnames immediately)
   if (!isIPSafe(bare)) {
+    console.error(JSON.stringify({ event: 'ssrf_blocked', reason: 'blocked_ip_range', url: rawUrl }));
     return null;
   }
 
@@ -233,10 +238,12 @@ async function getSafeUrl(rawUrl: string): Promise<string | null> {
     try {
       const resolved = await dns.promises.lookup(hostname);
       if (!isIPSafe(resolved.address)) {
+        console.error(JSON.stringify({ event: 'ssrf_blocked', reason: 'dns_rebinding', url: rawUrl, resolved: resolved.address }));
         return null;
       }
     } catch {
       // DNS lookup failed — reject the URL
+      console.error(JSON.stringify({ event: 'ssrf_blocked', reason: 'dns_lookup_failed', url: rawUrl }));
       return null;
     }
   }
@@ -249,9 +256,8 @@ async function getSafeUrl(rawUrl: string): Promise<string | null> {
 
 // A10 - SSRF: Remediated via defense-in-depth in getSafeUrl() (see above).
 // redirect:'error' prevents open-redirect chains from bypassing hostname validation.
-// codeql[js/request-forgery] — URL validated by getSafeUrl(): HTTPS-only, private-IP
-// blocklist (IPv4 + IPv6 including fc00::/7 and ::ffff: ranges), DNS pre-resolution
-// (prevents rebinding), port restriction, and redirects disabled.
+const MAX_RESPONSE_SIZE = 10 * 1024 * 1024; // 10 MB hard cap on response size
+
 app.post('/api/fetch-url', async (req, res) => {
   const { url } = req.body;
 
@@ -261,12 +267,54 @@ app.post('/api/fetch-url', async (req, res) => {
     return;
   }
 
+  // Domain allowlist: when ALLOWED_FETCH_DOMAINS is configured, only listed domains are permitted (deny-by-default)
+  const allowedDomains = process.env.ALLOWED_FETCH_DOMAINS;
+  if (allowedDomains) {
+    const allowed = allowedDomains.split(',').map(d => d.trim().toLowerCase());
+    const hostname = new URL(safeHref).hostname.toLowerCase();
+    if (!allowed.includes(hostname)) {
+      console.error(JSON.stringify({ event: 'ssrf_blocked', reason: 'domain_not_in_allowlist', url: safeHref }));
+      res.status(400).json({ error: 'Invalid or disallowed URL' });
+      return;
+    }
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 5000);
+
   try {
-    const response = await fetch(safeHref, { redirect: 'error' });
+    // codeql[js/request-forgery] — URL validated by getSafeUrl(): HTTPS-only, private-IP
+    // blocklist (IPv4 + IPv6 including fc00::/7 and ::ffff: ranges), DNS pre-resolution
+    // (prevents rebinding), port restriction, redirects disabled, and domain allowlist enforced.
+    const response = await fetch(safeHref, { redirect: 'error', signal: controller.signal });
+    clearTimeout(timeoutId);
+
+    // Reject oversized responses early via Content-Length header
+    const contentLength = response.headers?.get?.('content-length');
+    if (contentLength && parseInt(contentLength, 10) > MAX_RESPONSE_SIZE) {
+      console.error(JSON.stringify({ event: 'ssrf_blocked', reason: 'response_too_large_content_length', url: safeHref }));
+      res.status(502).json({ error: 'Response too large' });
+      return;
+    }
+
     const data = await response.text();
+
+    // Hard cap on streamed body size
+    if (data.length > MAX_RESPONSE_SIZE) {
+      console.error(JSON.stringify({ event: 'ssrf_blocked', reason: 'response_too_large_body', url: safeHref }));
+      res.status(502).json({ error: 'Response too large' });
+      return;
+    }
+
+    console.info(JSON.stringify({ event: 'external_fetch', hostname: new URL(safeHref).hostname, status: response.status, bytes: data.length }));
     res.json({ content: data });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch URL' });
+    clearTimeout(timeoutId);
+    if ((error as Error).name === 'AbortError') {
+      res.status(500).json({ error: 'Request timed out' });
+    } else {
+      res.status(500).json({ error: 'Failed to fetch URL' });
+    }
   }
 });
 
