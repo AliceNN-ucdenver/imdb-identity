@@ -131,6 +131,42 @@ async function fetchPrompt(category, file) {
 }
 
 // ============================================================================
+// SOURCE SNIPPET EXTRACTION
+// ============================================================================
+
+/**
+ * Read source lines from the checked-out repo when SARIF doesn't include a snippet.
+ * Returns the relevant lines with 2 lines of context above and below, or '' if unreadable.
+ */
+function extractSnippetFromFile(filePath, startLine, endLine) {
+  // SARIF paths may be relative or use forward slashes
+  const normalized = filePath.replace(/^\/+/, '');
+  const candidates = [normalized, path.resolve(normalized)];
+  // Also try relative to GITHUB_WORKSPACE if set
+  if (process.env.GITHUB_WORKSPACE) {
+    candidates.push(path.join(process.env.GITHUB_WORKSPACE, normalized));
+  }
+
+  for (const candidate of candidates) {
+    try {
+      if (!fs.existsSync(candidate)) { continue; }
+      const lines = fs.readFileSync(candidate, 'utf8').split('\n');
+      const contextLines = 2;
+      const from = Math.max(0, startLine - 1 - contextLines);
+      const to = Math.min(lines.length, endLine + contextLines);
+      const extracted = [];
+      for (let i = from; i < to; i++) {
+        const lineNum = i + 1;
+        const marker = (lineNum >= startLine && lineNum <= endLine) ? '>' : ' ';
+        extracted.push(`${marker} ${String(lineNum).padStart(4)} | ${lines[i]}`);
+      }
+      return extracted.join('\n');
+    } catch { /* try next candidate */ }
+  }
+  return '';
+}
+
+// ============================================================================
 // SARIF PARSING
 // ============================================================================
 
@@ -210,6 +246,18 @@ function parseSARIFResults(sarifPath) {
         log('WARN', `    Rule "${result.ruleId}" NOT found in driver.rules or extensions — no severity score available`);
       }
 
+      const filePath = location.artifactLocation?.uri || 'unknown';
+      const startLine = location.region?.startLine || 1;
+      const endLine = location.region?.endLine || location.region?.startLine || 1;
+      // Prefer SARIF-embedded snippet, fall back to reading the source file
+      let codeSnippet = location.region?.snippet?.text || '';
+      if (!codeSnippet && filePath !== 'unknown') {
+        codeSnippet = extractSnippetFromFile(filePath, startLine, endLine);
+        if (codeSnippet) {
+          log('INFO', `    Extracted snippet from source file for ${filePath}:${startLine}`);
+        }
+      }
+
       vulnerabilities.push({
         ruleId: result.ruleId,
         ruleName: rule?.shortDescription?.text || result.ruleId,
@@ -218,10 +266,10 @@ function parseSARIFResults(sarifPath) {
         level,
         severity,
         securityScore: isNaN(secScore) ? null : secScore,
-        filePath: location.artifactLocation?.uri || 'unknown',
-        startLine: location.region?.startLine || 1,
-        endLine: location.region?.endLine || location.region?.startLine || 1,
-        codeSnippet: location.region?.snippet?.text || '',
+        filePath,
+        startLine,
+        endLine,
+        codeSnippet,
         tool, toolVersion
       });
     }
