@@ -133,25 +133,26 @@ app.post('/api/upload', (req, res) => {
   res.json({ message: 'File uploaded', fileName });
 });
 
-// Validates a URL to prevent SSRF attacks
-function isSafeUrl(rawUrl: string): boolean {
+// Validates a URL to prevent SSRF attacks.
+// Returns the parsed URL object if safe, otherwise null.
+function getSafeUrl(rawUrl: string): URL | null {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
   } catch {
-    return false;
+    return null;
   }
 
   // Only allow HTTPS
   if (parsed.protocol !== 'https:') {
-    return false;
+    return null;
   }
 
   const hostname = parsed.hostname.toLowerCase();
 
   // Block localhost and loopback
   if (hostname === 'localhost' || hostname === '0.0.0.0') {
-    return false;
+    return null;
   }
 
   // Block IPv4 private, loopback, and link-local ranges
@@ -162,7 +163,7 @@ function isSafeUrl(rawUrl: string): boolean {
     const [o1, o2, o3, o4] = ipv4.slice(1).map(Number);
     // Reject invalid octets (> 255)
     if (o1 > 255 || o2 > 255 || o3 > 255 || o4 > 255) {
-      return false;
+      return null;
     }
     if (
       o1 === 10 ||                               // 10.0.0.0/8
@@ -171,30 +172,32 @@ function isSafeUrl(rawUrl: string): boolean {
       (o1 === 172 && o2 >= 16 && o2 <= 31) ||   // 172.16.0.0/12
       (o1 === 192 && o2 === 168)                 // 192.168.0.0/16
     ) {
-      return false;
+      return null;
     }
   }
 
   // Block IPv6 loopback (::1) and link-local (fe80::/10 covers fe80:: – febf::)
   const bare = hostname.replace(/^\[|\]$/g, '');
   if (bare === '::1' || /^fe[89ab]/i.test(bare)) {
-    return false;
+    return null;
   }
 
-  return true;
+  return parsed;
 }
 
-// A10 - SSRF: Fixed with URL validation
+// A10 - SSRF: Fixed with URL validation; fetch uses the parsed URL's href,
+// not the raw user input, to break the taint chain (CodeQL js/request-forgery).
 app.post('/api/fetch-url', async (req, res) => {
   const { url } = req.body;
 
-  if (!url || !isSafeUrl(url)) {
+  const safeUrl = getSafeUrl(url);
+  if (!safeUrl) {
     res.status(400).json({ error: 'Invalid or disallowed URL' });
     return;
   }
 
   try {
-    const response = await fetch(url);
+    const response = await fetch(safeUrl.href);
     const data = await response.text();
     res.json({ content: data });
   } catch (error) {
