@@ -1,0 +1,5 @@
+# Project metadata — written by MaintainabilityAI
+language: TypeScript
+module_system: CommonJS
+testing: Mocha
+package_manager: npm
