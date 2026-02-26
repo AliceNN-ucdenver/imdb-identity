@@ -20,65 +20,82 @@ const pool = new Pool({
   connectionString: 'postgresql://admin:password123@localhost:5432/mydb'
 });
 
-// A03 - Injection: Vulnerable login endpoint
+// A03 - Injection: Remediated login endpoint
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
 
-  // SQL Injection vulnerability - string concatenation
-  const query = `SELECT * FROM users WHERE username = '${username}' AND password = '${password}'`;
+  // Input validation
+  if (!username || !password || typeof username !== 'string' || typeof password !== 'string') {
+    res.status(400).json({ success: false, message: 'Username and password are required' });
+    return;
+  }
 
   try {
-    const result = await pool.query(query);
+    // Parameterized query — eliminates SQL injection risk
+    const result = await pool.query(
+      'SELECT id, username FROM users WHERE username = $1 AND password = $2',
+      [username, password]
+    );
 
     if (result.rows.length > 0) {
       // A07 - Authentication Failure: No password hashing
       res.json({
         success: true,
-        user: result.rows[0]  // A01: Exposing full user record
+        user: result.rows[0]
       });
     } else {
       res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
   } catch (error) {
-    // A09 - Logging Failure: Exposing sensitive error details
-    res.status(500).json({
-      error: (error as Error).message,
-      query: query  // Exposing query structure
-    });
+    // Generic error — no query structure or internal details exposed
+    res.status(500).json({ error: 'An internal error occurred' });
   }
 });
 
-// A03 - Injection: Vulnerable search endpoint
+// A03 - Injection: Remediated search endpoint
 app.get('/api/users/search', async (req, res) => {
   const searchTerm = req.query.q;
 
-  // NoSQL-style injection if using JSON queries
-  const query = `SELECT * FROM users WHERE name LIKE '%${searchTerm}%'`;
+  // Input validation: must be a non-empty string within a reasonable length
+  if (!searchTerm || typeof searchTerm !== 'string' || searchTerm.length > 100) {
+    res.status(400).json({ error: 'Invalid or missing search term' });
+    return;
+  }
 
   try {
-    const result = await pool.query(query);
+    // Parameterized query — % wildcards are safe values passed as a parameter
+    const result = await pool.query(
+      'SELECT id, username, name FROM users WHERE name ILIKE $1',
+      [`%${searchTerm}%`]
+    );
     res.json(result.rows);
   } catch (error) {
-    res.status(500).json({ error: (error as Error).message });
+    res.status(500).json({ error: 'An internal error occurred' });
   }
 });
 
 // A01 - Broken Access Control: No authorization check
 app.get('/api/admin/users/:id', async (req, res) => {
-  const userId = req.params.id;
-
-  // Direct object reference without ownership check
-  const query = `SELECT * FROM users WHERE id = ${userId}`;
+  // Parse and validate the id parameter to a safe integer
+  const userId = parseInt(req.params.id, 10);
+  if (isNaN(userId) || userId <= 0) {
+    res.status(400).json({ error: 'Invalid user ID' });
+    return;
+  }
 
   try {
-    const result = await pool.query(query);
+    // Parameterized query — integer parameter eliminates SQL injection risk
+    const result = await pool.query(
+      'SELECT id, username, name, email FROM users WHERE id = $1',
+      [userId]
+    );
     if (result.rows.length > 0) {
       res.json(result.rows[0]);
     } else {
       res.status(404).json({ error: 'User not found' });
     }
   } catch (error) {
-    res.status(500).json({ error: (error as Error).message });
+    res.status(500).json({ error: 'An internal error occurred' });
   }
 });
 
@@ -104,9 +121,17 @@ app.post('/api/password-reset', async (req, res) => {
   // Predictable token based on timestamp
   const resetToken = Math.floor(Date.now() / 1000).toString();
 
+  // Input validation
+  if (!email || typeof email !== 'string' || email.length > 254) {
+    res.status(400).json({ error: 'Invalid email address' });
+    return;
+  }
+
   // Store in database without expiration
+  // Parameterized query — eliminates SQL injection risk
   await pool.query(
-    `UPDATE users SET reset_token = '${resetToken}' WHERE email = '${email}'`
+    'UPDATE users SET reset_token = $1 WHERE email = $2',
+    [resetToken, email]
   );
 
   res.json({
